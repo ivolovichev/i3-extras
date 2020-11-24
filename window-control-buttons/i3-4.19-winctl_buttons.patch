@@ -1,0 +1,345 @@
+diff -r -u a/include/configuration.h b/include/configuration.h
+--- a/include/configuration.h	1970-01-01 03:00:00.000000000 +0300
++++ b/include/configuration.h	2020-11-24 15:50:57.105943886 +0200
+@@ -14,6 +14,8 @@
+ 
+ #include "queue.h"
+ #include "i3.h"
++#include <cairo/cairo-xcb.h>
++#include <pango/pangocairo.h>
+ 
+ typedef struct Config Config;
+ typedef struct Barconfig Barconfig;
+@@ -399,6 +401,49 @@
+     C_RELOAD,
+ } config_load_t;
+ 
++#define ICONFONTNAME  		"Font Awesome"
++#define WINCTL1_BUTTON_CLICK	11
++#define WINCTL2_BUTTON_CLICK	12
++#define WINCTL3_BUTTON_CLICK	13
++#define WINCTL4_BUTTON_CLICK	14
++#define WINCTL5_BUTTON_CLICK	15
++
++typedef struct {
++    char glyph[4];
++    char *str;
++    i3String * i3str;
++    int width;
++    int roffset;
++    int btn;
++    } WINCTLICON;
++
++typedef struct {
++    int N;
++    int is_fa_present;
++    const char *font_family;
++    int height;
++    int spacer;
++    int descent;
++    int total_icons_width;
++    WINCTLICON *icons[];
++    } WINCTLICONS;
++
++/* 
++   "name" is a unique icon variable name,
++   "glyph" is the Unicode code of the sympol in FontAwersome charset (0xF000-0xFFFF)
++   "test" is a fallback text string representation of the icon if FontAwersome is missing
++   "button" mouse button number to use in the event if the icon is clicked on
++*/
++#define DEFINE_WINCTLICON(name, glyph, text, button) WINCTLICON name = {{'\xEF', ((glyph >> 6) & 0x3F) | 0x80 , (glyph & 0x3F) | 0x80, '\x00'}, text, NULL, 0, 0, button};
++
++
++/* Arguments are pointers to WINCTLICON variables */
++#define DECLARE_WINCTLICONS(...) WINCTLICONS winctl_icons = {0, 0 , NULL, 0, 0, 0, 0, {__VA_ARGS__, NULL}};
++#define DECLARE_WINCTLICONSEXTERN extern WINCTLICONS winctl_icons;
++
++void load_wctlbtn_config(void);
++void free_wctlbtn_config(void);
++
+ /**
+  * (Re-)loads the configuration file (sets useful defaults before).
+  *
+diff -r -u a/include/libi3.h b/include/libi3.h
+--- a/include/libi3.h	1970-01-01 03:00:00.000000000 +0300
++++ b/include/libi3.h	2020-11-24 15:50:57.105943886 +0200
+@@ -392,6 +392,12 @@
+  */
+ void set_font(i3Font *font);
+ 
++/*
++ * Gets current font previously defined by set_font call
++ *
++ */
++i3Font *get_current_font(void);
++
+ /**
+  * Frees the resources taken by the current font. If no font was previously
+  * loaded, it simply returns.
+diff -r -u a/include/x.h b/include/x.h
+--- a/include/x.h	1970-01-01 03:00:00.000000000 +0300
++++ b/include/x.h	2020-11-24 15:50:57.106943873 +0200
+@@ -142,3 +142,9 @@
+  * Enables or disables nonrectangular shape of the container frame.
+  */
+ void x_set_shape(Con *con, xcb_shape_sk_t kind, bool enable);
++
++/*
++ * Draws window control icons using Font Awesome glyphs
++ * by means of Cairo Graphics library functions
++ */
++void draw_winctl_icons(surface_t *surface, color_t fg_color, color_t bg_color, int x, int y, int max_width);
+diff -r -u a/libi3/font.c b/libi3/font.c
+--- a/libi3/font.c	1970-01-01 03:00:00.000000000 +0300
++++ b/libi3/font.c	2020-11-24 15:50:57.107943861 +0200
+@@ -254,6 +254,14 @@
+ }
+ 
+ /*
++ * Gets current font previously defined by set_font call
++ *
++ */
++i3Font *get_current_font(void) {
++    return savedFont;
++}
++
++/*
+  * Frees the resources taken by the current font. If no font was previously
+  * loaded, it simply returns.
+  *
+diff -r -u a/src/click.c b/src/click.c
+--- a/src/click.c	1970-01-01 03:00:00.000000000 +0300
++++ b/src/click.c	2020-11-24 15:50:57.108943848 +0200
+@@ -15,6 +15,8 @@
+                CLICK_DECORATION = 1,
+                CLICK_INSIDE = 2 } click_destination_t;
+ 
++DECLARE_WINCTLICONSEXTERN;
++
+ /*
+  * Finds the correct pair of first/second cons between the resize will take
+  * place according to the passed border position (top, left, right, bottom),
+@@ -155,6 +157,31 @@
+     if (con->parent->type == CT_DOCKAREA)
+         goto done;
+ 
++    /* Handle window control buttons */
++    int i, roffset;
++
++    roffset = con->deco_rect.width - (event->event_x - con->deco_rect.x);
++    if (dest == CLICK_DECORATION && event->detail == XCB_BUTTON_CLICK_LEFT) {
++	for(i = winctl_icons.N - 1; i >= 0; i--) {
++	    if(roffset >= winctl_icons.icons[i]->roffset - winctl_icons.icons[i]->width && roffset <= winctl_icons.icons[i]->roffset) break;
++	    }
++	if(i >= 0) {
++	    event->detail = winctl_icons.icons[i]->btn;
++    	    Binding *bind = get_binding_from_xcb_event((xcb_generic_event_t *)event);
++
++    	    if (bind != NULL) {
++        	CommandResult *result = run_binding(bind, con);
++
++        	/* ASYNC_POINTER eats the event */
++        	xcb_allow_events(conn, XCB_ALLOW_ASYNC_POINTER, event->time);
++        	xcb_flush(conn);
++
++        	command_result_free(result);
++        	return 0;
++        	}
++    	    }
++	}
++
+     /* if the user has bound an action to this click, it should override the
+      * default behavior. */
+     Binding *bind = get_binding_from_xcb_event((xcb_generic_event_t *)event);
+diff -r -u a/src/config.c b/src/config.c
+--- a/src/config.c	1970-01-01 03:00:00.000000000 +0300
++++ b/src/config.c	2020-11-24 15:50:57.108943848 +0200
+@@ -17,6 +17,11 @@
+ Config config;
+ struct modes_head modes;
+ struct barconfig_head barconfigs = TAILQ_HEAD_INITIALIZER(barconfigs);
++DEFINE_WINCTLICON(ICON_MINIMIZE, 0xF2D1, "[_]", WINCTL1_BUTTON_CLICK);
++DEFINE_WINCTLICON(ICON_FLOAT, 0xF2D2, "[o]", WINCTL2_BUTTON_CLICK);
++DEFINE_WINCTLICON(ICON_FULLSCREEN, 0xF2D0, "[O]", WINCTL3_BUTTON_CLICK);
++DEFINE_WINCTLICON(ICON_CLOSE, 0xF410, "[X]", WINCTL4_BUTTON_CLICK);
++DECLARE_WINCTLICONS(&ICON_MINIMIZE, &ICON_FLOAT, &ICON_FULLSCREEN, &ICON_CLOSE)
+ 
+ /*
+  * Ungrabs all keys, to be called before re-grabbing the keys because of a
+@@ -245,5 +250,75 @@
+         xcb_flush(conn);
+     }
+ 
++    load_wctlbtn_config();
++
+     return result;
+ }
++
++void load_wctlbtn_config(void)
++{
++    PangoFontFamily **families;
++    int fnlen, n_families;
++    PangoFontMap *fontmap;
++    i3Font *currentFont;
++
++    fnlen = strlen(ICONFONTNAME);
++    fontmap = pango_cairo_font_map_get_default();
++    pango_font_map_list_families (fontmap, &families, &n_families);
++
++    winctl_icons.is_fa_present = 0;
++    while(winctl_icons.icons[winctl_icons.N] != NULL) winctl_icons.N++;
++    winctl_icons.height = config.font.height;
++
++    for (int i = 0; i < n_families; i++) {
++        PangoFontFamily *family = families[i];
++        const char *family_name = pango_font_family_get_name (family);
++        if(strlen(family_name) < fnlen || strncasecmp(family_name, ICONFONTNAME, fnlen)) continue;
++        if(strcasestr(family_name, "Brands") != NULL) continue;
++        winctl_icons.font_family = family_name;
++        winctl_icons.is_fa_present = 1;
++        break;
++    }
++    g_free (families);
++
++    if(winctl_icons.is_fa_present) {
++        winctl_icons.spacer = config.font.height / 2;
++	cairo_surface_t *surface = cairo_xcb_surface_create(conn, root_screen->root, get_visualtype(root_screen), 1, 1);
++	cairo_t *cr = cairo_create(surface);
++	cairo_select_font_face (cr, winctl_icons.font_family, CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
++	cairo_set_font_size (cr, winctl_icons.height);
++	cairo_text_extents_t extents;
++	cairo_font_extents_t fexts;
++	cairo_font_extents(cr, &fexts);
++	winctl_icons.descent = fexts.descent;
++
++	for(int i = 0; i < winctl_icons.N; i++) {
++	    cairo_text_extents(cr, winctl_icons.icons[i]->glyph, &extents);
++	    winctl_icons.icons[i]->width = extents.width;
++	    }
++	}
++    else {
++        winctl_icons.spacer = 0;
++        currentFont = get_current_font();
++    	for(int i = 0; i < winctl_icons.N; i++) {
++    	    if(winctl_icons.icons[i]->i3str != NULL) I3STRING_FREE(winctl_icons.icons[i]->i3str);
++	    winctl_icons.icons[i]->i3str = i3string_from_utf8(winctl_icons.icons[i]->str);
++	    set_font(&config.font);
++	    winctl_icons.icons[i]->width = predict_text_width(winctl_icons.icons[i]->i3str);
++	    }
++	set_font(currentFont);
++	}
++
++    winctl_icons.total_icons_width = winctl_icons.spacer / 2;
++    for(int i = winctl_icons.N - 1; i >= 0; i--) {
++	winctl_icons.icons[i]->roffset = winctl_icons.total_icons_width + winctl_icons.icons[i]->width;
++	winctl_icons.total_icons_width = winctl_icons.icons[i]->roffset + winctl_icons.spacer;
++	}
++    winctl_icons.total_icons_width -= winctl_icons.spacer;
++}
++
++void free_wctlbtn_config(void)
++{
++    for(int i = 0; i < winctl_icons.N; i++)
++	if(winctl_icons.icons[i]->i3str != NULL) I3STRING_FREE(winctl_icons.icons[i]->i3str);
++}
+diff -r -u a/src/main.c b/src/main.c
+--- a/src/main.c	1970-01-01 03:00:00.000000000 +0300
++++ b/src/main.c	2020-11-24 15:50:57.109943836 +0200
+@@ -197,6 +197,8 @@
+ #ifdef I3_ASAN_ENABLED
+     __lsan_do_leak_check();
+ #endif
++
++    free_wctlbtn_config();
+ }
+ 
+ /*
+diff -r -u a/src/x.c b/src/x.c
+--- a/src/x.c	1970-01-01 03:00:00.000000000 +0300
++++ b/src/x.c	2020-11-24 15:50:57.110943823 +0200
+@@ -16,6 +16,8 @@
+ #define MAX(x, y) ((x) > (y) ? (x) : (y))
+ #endif
+ 
++DECLARE_WINCTLICONSEXTERN;
++
+ /* Stores the X11 window ID of the currently focused window */
+ xcb_window_t focused_id = XCB_NONE;
+ 
+@@ -385,16 +387,18 @@
+     /* Redraw the right border to cut off any text that went past it.
+      * This is necessary when the text was drawn using XCB since cutting text off
+      * automatically does not work there. For pango rendering, this isn't necessary. */
+-    if (!font_is_pango()) {
+-        /* We actually only redraw the far right two pixels as that is the
+-         * distance we keep from the edge (not the entire border width).
+-         * Redrawing the entire border would cause text to be cut off. */
+-        draw_util_rectangle(&(con->parent->frame_buffer), p->color->background,
+-                            dr->x + dr->width - 2 * logical_px(1),
+-                            dr->y,
+-                            2 * logical_px(1),
+-                            dr->height);
+-    }
++
++    draw_util_rectangle(&(con->parent->frame_buffer), p->color->background,
++                        dr->x + dr->width - 4 * logical_px(1) - winctl_icons.total_icons_width,
++                        dr->y,
++                        4 * logical_px(1) + winctl_icons.total_icons_width,
++                        dr->height);
++
++    /* Draw window control icons */
++    draw_winctl_icons(&(con->parent->frame_buffer), p->color->text, p->color->background,
++                	dr->x + dr->width - 2 * logical_px(1) - winctl_icons.total_icons_width,
++                	dr->y + (con->deco_rect.height - winctl_icons.height) / 2,
++                	winctl_icons.total_icons_width);
+ 
+     /* Redraw the border. */
+     x_draw_title_border(con, p);
+@@ -1480,3 +1484,47 @@
+         xcb_flush(conn);
+     }
+ }
++
++/*
++ * Draws window control icons using Font Awesome glyphs
++ * by means of Cairo Graphics library functions
++ */
++void draw_winctl_icons(surface_t *surface, color_t fg_color, color_t bg_color, int x, int y, int max_width) {
++    if(surface->id == XCB_NONE) {
++	ELOG("Surface %p is not initialized, skipping drawing.\n", surface);
++        return;
++        }
++
++    if(!winctl_icons.is_fa_present) {
++        for(int i = 0; i < winctl_icons.N; i++) {
++    	    draw_util_text(winctl_icons.icons[i]->i3str, surface, fg_color, bg_color, x, y, winctl_icons.icons[i]->width);
++    	    x += winctl_icons.icons[i]->width + winctl_icons.spacer;
++    	    }
++        return;
++        }
++
++    y -= winctl_icons.descent;
++
++    /* Flush any changes before we draw the text as this might use XCB directly. */
++    CAIRO_SURFACE_FLUSH(surface->surface);
++
++    y += winctl_icons.height;
++    cairo_surface_t *surf = cairo_xcb_surface_create(conn, surface->id, surface->visual_type, x + max_width, y + winctl_icons.height);
++    cairo_t *cr = cairo_create(surf);
++
++    cairo_select_font_face(cr, winctl_icons.font_family, CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
++    cairo_set_font_size(cr, winctl_icons.height);
++    cairo_set_source_rgb(cr, fg_color.red, fg_color.green, fg_color.blue);
++
++    for(int i = 0; i < winctl_icons.N; i++) {
++	cairo_move_to(cr, x, y);
++	cairo_show_text (cr, winctl_icons.icons[i]->glyph);
++	x += winctl_icons.icons[i]->width + winctl_icons.spacer;
++	}
++
++    cairo_destroy(cr);
++    cairo_surface_destroy(surf);
++
++    /* Notify cairo that we (possibly) used another way to draw on the surface. */
++    cairo_surface_mark_dirty(surface->surface);
++}
