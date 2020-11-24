@@ -1,0 +1,320 @@
+diff -r -u a/include/data.h b/include/data.h
+--- a/include/data.h	1970-01-01 03:00:00.000000000 +0300
++++ b/include/data.h	2020-11-24 16:12:42.386625632 +0200
+@@ -479,6 +479,11 @@
+ 
+     /* The window has been swallowed. */
+     bool swallowed;
++
++    /** Window icon, as array of ARGB pixels */
++    uint32_t* icon;
++    int icon_width;
++    int icon_height;
+ };
+ 
+ /**
+diff -r -u a/include/i3-atoms_rest.xmacro.h b/include/i3-atoms_rest.xmacro.h
+--- a/include/i3-atoms_rest.xmacro.h	1970-01-01 03:00:00.000000000 +0300
++++ b/include/i3-atoms_rest.xmacro.h	2020-11-24 16:08:25.389838534 +0200
+@@ -3,6 +3,7 @@
+ xmacro(_NET_WM_USER_TIME) \
+ xmacro(_NET_STARTUP_ID) \
+ xmacro(_NET_WORKAREA) \
++xmacro(_NET_WM_ICON) \
+ xmacro(WM_PROTOCOLS) \
+ xmacro(WM_DELETE_WINDOW) \
+ xmacro(UTF8_STRING) \
+diff -r -u a/include/libi3.h b/include/libi3.h
+--- a/include/libi3.h	1970-01-01 03:00:00.000000000 +0300
++++ b/include/libi3.h	2020-11-24 15:57:30.885020970 +0200
+@@ -619,6 +619,11 @@
+ void draw_util_text(i3String *text, surface_t *surface, color_t fg_color, color_t bg_color, int x, int y, int max_width);
+ 
+ /**
++ * Draw the given image using libi3.
++ */
++void draw_util_image(unsigned char *src, int src_width, int src_height, surface_t *surface, int x, int y, int width, int height);
++
++/**
+  * Draws a filled rectangle.
+  * This function is a convenience wrapper and takes care of flushing the
+  * surface as well as restoring the cairo state.
+diff -r -u a/include/window.h b/include/window.h
+--- a/include/window.h	1970-01-01 03:00:00.000000000 +0300
++++ b/include/window.h	2020-11-24 15:57:30.887020945 +0200
+@@ -95,3 +95,9 @@
+  *
+  */
+ void window_update_motif_hints(i3Window *win, xcb_get_property_reply_t *prop, border_style_t *motif_border_style);
++
++/**
++ * Updates the _NET_WM_ICON
++ *
++ */
++void window_update_icon(i3Window *win, xcb_get_property_reply_t *prop);
+diff -r -u a/libi3/draw_util.c b/libi3/draw_util.c
+--- a/libi3/draw_util.c	1970-01-01 03:00:00.000000000 +0300
++++ b/libi3/draw_util.c	2020-11-24 15:57:30.883020995 +0200
+@@ -139,6 +139,40 @@
+     cairo_surface_mark_dirty(surface->surface);
+ }
+ 
++/**
++ * Draw the given image using libi3.
++ * This function is a convenience wrapper and takes care of flushing the
++ * surface as well as restoring the cairo state.
++ *
++ */
++void draw_util_image(unsigned char *src, int src_width, int src_height, surface_t *surface, int x, int y, int width, int height) {
++    RETURN_UNLESS_SURFACE_INITIALIZED(surface);
++
++    double scale;
++
++    cairo_save(surface->cr);
++
++    cairo_surface_t *image;
++
++    image = cairo_image_surface_create_for_data(
++            src,
++            CAIRO_FORMAT_ARGB32,
++            src_width,
++            src_height,
++            src_width * 4);
++
++    cairo_translate(surface->cr, x, y);
++
++    scale = MIN((double)width / src_width, (double)height / src_height);
++    cairo_scale(surface->cr, scale, scale);
++
++    cairo_set_source_surface(surface->cr, image, 0, 0);
++    cairo_paint(surface->cr);
++
++    cairo_surface_destroy(image);
++
++    cairo_restore(surface->cr);
++}
+ /*
+  * Draws a filled rectangle.
+  * This function is a convenience wrapper and takes care of flushing the
+diff -r -u a/src/handlers.c b/src/handlers.c
+--- a/src/handlers.c	1970-01-01 03:00:00.000000000 +0300
++++ b/src/handlers.c	2020-11-24 16:23:50.823269024 +0200
+@@ -1175,6 +1175,19 @@
+     return true;
+ }
+ 
++static bool handle_windowicon_change(void *data, xcb_connection_t *conn, uint8_t state,
++                                     xcb_window_t window, xcb_atom_t atom, xcb_get_property_reply_t *prop) {
++    Con *con;
++    if ((con = con_by_window_id(window)) == NULL || con->window == NULL)
++        return false;
++
++    window_update_icon(con->window, prop);
++
++    x_push_changes(croot);
++
++    return true;
++}
++
+ /* Returns false if the event could not be processed (e.g. the window could not
+  * be found), true otherwise */
+ typedef bool (*cb_property_handler_t)(Con *con, xcb_get_property_reply_t *property);
+@@ -1197,7 +1210,8 @@
+     {0, UINT_MAX, handle_strut_partial_change},
+     {0, UINT_MAX, handle_window_type},
+     {0, UINT_MAX, handle_i3_floating},
+-    {0, 5 * sizeof(uint64_t), handle_motif_hints_change}};
++    {0, 5 * sizeof(uint64_t), handle_motif_hints_change},
++    {0, UINT_MAX, handle_windowicon_change}};
+ #define NUM_HANDLERS (sizeof(property_handlers) / sizeof(struct property_handler_t))
+ 
+ /*
+@@ -1220,6 +1234,7 @@
+     property_handlers[9].atom = A__NET_WM_WINDOW_TYPE;
+     property_handlers[10].atom = A_I3_FLOATING_WINDOW;
+     property_handlers[11].atom = A__MOTIF_WM_HINTS;
++    property_handlers[12].atom = A__NET_WM_ICON;
+ }
+ 
+ static void property_notify(uint8_t state, xcb_window_t window, xcb_atom_t atom) {
+diff -r -u a/src/manage.c b/src/manage.c
+--- a/src/manage.c	1970-01-01 03:00:00.000000000 +0300
++++ b/src/manage.c	2020-11-24 15:57:30.886020957 +0200
+@@ -118,6 +118,8 @@
+         role_cookie, startup_id_cookie, wm_hints_cookie,
+         wm_normal_hints_cookie, motif_wm_hints_cookie, wm_user_time_cookie, wm_desktop_cookie;
+ 
++    xcb_get_property_cookie_t wm_icon_cookie;
++
+     geomc = xcb_get_geometry(conn, d);
+ 
+     /* Check if the window is mapped (it could be not mapped when intializing and
+@@ -189,6 +191,7 @@
+     motif_wm_hints_cookie = GET_PROPERTY(A__MOTIF_WM_HINTS, 5 * sizeof(uint64_t));
+     wm_user_time_cookie = GET_PROPERTY(A__NET_WM_USER_TIME, UINT32_MAX);
+     wm_desktop_cookie = GET_PROPERTY(A__NET_WM_DESKTOP, UINT32_MAX);
++    wm_icon_cookie = GET_PROPERTY(A__NET_WM_ICON, UINT32_MAX);
+ 
+     i3Window *cwindow = scalloc(1, sizeof(i3Window));
+     cwindow->id = window;
+@@ -202,6 +205,7 @@
+     window_update_class(cwindow, xcb_get_property_reply(conn, class_cookie, NULL));
+     window_update_name_legacy(cwindow, xcb_get_property_reply(conn, title_cookie, NULL));
+     window_update_name(cwindow, xcb_get_property_reply(conn, utf8_title_cookie, NULL));
++    window_update_icon(cwindow, xcb_get_property_reply(conn, wm_icon_cookie, NULL));
+     window_update_leader(cwindow, xcb_get_property_reply(conn, leader_cookie, NULL));
+     window_update_transient_for(cwindow, xcb_get_property_reply(conn, transient_cookie, NULL));
+     window_update_strut_partial(cwindow, xcb_get_property_reply(conn, strut_cookie, NULL));
+diff -r -u a/src/render.c b/src/render.c
+--- a/src/render.c	1970-01-01 03:00:00.000000000 +0300
++++ b/src/render.c	2020-11-24 15:57:30.886020957 +0200
+@@ -100,6 +100,10 @@
+     /* find the height for the decorations */
+     params.deco_height = render_deco_height();
+ 
++    /* minimum decoration height to allow icon to fit
++     * not actually required, icon would be cropped otherwise */
++    params.deco_height = (params.deco_height < 16) ? 16 : params.deco_height;
++
+     /* precalculate the sizes to be able to correct rounding errors */
+     params.sizes = precalculate_sizes(con, &params);
+ 
+diff -r -u a/src/window.c b/src/window.c
+--- a/src/window.c	1970-01-01 03:00:00.000000000 +0300
++++ b/src/window.c	2020-11-24 15:57:30.887020945 +0200
+@@ -19,6 +19,7 @@
+     FREE(win->class_class);
+     FREE(win->class_instance);
+     i3string_free(win->name);
++    FREE(win->icon);
+     FREE(win->ran_assignments);
+     FREE(win);
+ }
+@@ -466,3 +467,75 @@
+ #undef MWM_DECOR_BORDER
+ #undef MWM_DECOR_TITLE
+ }
++
++void window_update_icon(i3Window *win, xcb_get_property_reply_t *prop)
++{
++    uint32_t *data = NULL;
++    uint64_t len = 0;
++
++    if (!prop || prop->type != XCB_ATOM_CARDINAL || prop->format != 32) {
++        DLOG("_NET_WM_ICON is not set\n");
++        FREE(prop);
++        return;
++    }
++
++    uint32_t prop_value_len = xcb_get_property_value_length(prop);
++    uint32_t *prop_value = (uint32_t *) xcb_get_property_value(prop);
++
++    /* Find the number of icons in the reply. */
++    while (prop_value_len > (sizeof(uint32_t) * 2) && prop_value &&
++            prop_value[0] && prop_value[1])
++    {
++        /* Check that the property is as long as it should be (in bytes),
++           handling integer overflow. "+2" to handle the width and height
++           fields. */
++        const uint64_t crt_len = prop_value[0] * (uint64_t) prop_value[1];
++        const uint64_t expected_len = (crt_len + 2) * 4;
++
++        if (expected_len > prop_value_len) {
++            break;
++        }
++
++        if (len == 0 || (crt_len >= 16*16 && crt_len < len)) {
++            len = crt_len;
++            data = prop_value;
++        }
++        if (len == 16*16) {
++            break; /* found 16 pixels icon */
++        }
++
++        /* Find pointer to next icon in the reply. */
++        prop_value_len -= expected_len;
++        prop_value = (uint32_t *) (((uint8_t *) prop_value) + expected_len);
++    }
++
++    if (!data) {
++        DLOG("Could not get _NET_WM_ICON\n");
++        FREE(prop);
++        return;
++    }
++
++    LOG("Got _NET_WM_ICON of size: (%d,%d)\n", data[0], data[1]);
++    win->name_x_changed = true; /* trigger a redraw */
++
++    win->icon_width = data[0];
++    win->icon_height = data[1];
++    win->icon = srealloc(win->icon, len * 4);
++
++    for (uint64_t i = 0; i < len; i++) {
++        uint8_t r, g, b, a;
++        a = (data[2 + i] >> 24) & 0xff;
++        r = (data[2 + i] >> 16) & 0xff;
++        g = (data[2 + i] >>  8) & 0xff;
++        b = (data[2 + i] >>  0) & 0xff;
++
++        /* Cairo uses premultiplied alpha */
++        r = (r * a) / 0xff;
++        g = (g * a) / 0xff;
++        b = (b * a) / 0xff;
++
++        win->icon[i] = (a << 24) | (r << 16) | (g << 8) | b;
++    }
++
++    FREE(prop);
++}
+diff -r -u a/src/x.c b/src/x.c
+--- a/src/x.c	1970-01-01 03:00:00.000000000 +0300
++++ b/src/x.c	2020-11-24 15:57:30.888020932 +0200
+@@ -614,6 +614,7 @@
+ 
+     const int title_padding = logical_px(2);
+     const int deco_width = (int)con->deco_rect.width;
++
+     int mark_width = 0;
+     if (config.show_marks && !TAILQ_EMPTY(&(con->marks_head))) {
+         char *formatted_mark = sstrdup("");
+@@ -694,16 +695,38 @@
+             break;
+     }
+ 
++    int text_offset_x = 0;
++    if (win && win->icon)
++        text_offset_x = 18;
++
+     draw_util_text(title, &(parent->frame_buffer),
+                    p->color->text, p->color->background,
+-                   con->deco_rect.x + title_offset_x,
++                   con->deco_rect.x + text_offset_x + logical_px(2),
+                    con->deco_rect.y + text_offset_y,
+-                   deco_width - mark_width - 2 * title_padding);
++                   deco_width - text_offset_x - mark_width - 2 * title_padding);
+ 
+     if (win == NULL || con->title_format != NULL) {
+         I3STRING_FREE(title);
+     }
+ 
++    /* Draw the icon */
++    if (win && win->icon) {
++        uint16_t width = 16;
++        uint16_t height = 16;
++
++        int icon_offset_y = (con->deco_rect.height - height) / 2;
++
++        draw_util_image(
++                (unsigned char *)win->icon,
++                win->icon_width,
++                win->icon_height,
++                &(parent->frame_buffer),
++                con->deco_rect.x + logical_px(2),
++                con->deco_rect.y + icon_offset_y,
++                width,
++                height);
++    }
++
+     x_draw_decoration_after_title(con, p);
+ copy_pixmaps:
+     draw_util_copy_surface(&(con->frame_buffer), &(con->frame), 0, 0, 0, 0, con->rect.width, con->rect.height);
